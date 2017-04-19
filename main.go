@@ -3,6 +3,10 @@ package main
 import (
 	"fmt"
 	"net"
+	_ "net/http/pprof"
+	"runtime/pprof"
+	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,6 +24,7 @@ var (
 	shuffleCounter int32 = 0
 	udpClient      *dns.Client
 	tcpClient      *dns.Client
+	profilerFile   *os.File
 )
 
 type Config struct {
@@ -29,10 +34,14 @@ type Config struct {
 	UpstreamTimeout time.Duration `default:"3s" split_words:"true"`
 	DnsPort         string        `default:"53" split_words:"true"`
 	Ttl             uint32        `default:"60"`
-	SidecarStateUrl string        `default:"http://localhost:7777/state.json"`
+	SidecarStateUrl string        `default:"http://localhost:7777/state.json" split_words:"true"`
+	ProfileCpu      bool          `split_words:"true"`
 }
 
-func makeHandler(handler func(w dns.ResponseWriter, r *dns.Msg, config *Config, rcvr *receiver.Receiver), config *Config, rcvr *receiver.Receiver) func(w dns.ResponseWriter, r *dns.Msg) {
+// We wrap these up into a dns.HandlerFunc using makeHandler()
+type wrappedHandlerFunc func(w dns.ResponseWriter, r *dns.Msg, config *Config, rcvr *receiver.Receiver)
+
+func makeHandler(handler wrappedHandlerFunc, config *Config, rcvr *receiver.Receiver) dns.HandlerFunc {
 	return func(w dns.ResponseWriter, r *dns.Msg) {
 		handler(w, r, config, rcvr)
 	}
@@ -42,17 +51,25 @@ func getServicesForQuery(r *dns.Msg, state *catalog.ServicesState) []*service.Se
 	parts := strings.Split(r.Question[0].Name, ".")
 	svcName := parts[0]
 
-    var services []*service.Service
-    state.EachService(func(hostname *string, id *string, svc *service.Service) {
-        if svc.Name == name {
-            services = append(services, svc)
-        }
-    })
+	var services []*service.Service
+	// TODO Super naive. Better to cache this in a map on each update from the
+	// receiver rather than on each request! state.ByService() returns the right map.
+	state.EachService(func(hostname *string, id *string, svc *service.Service) {
+		if svc.Name == svcName && svc.Status == service.ALIVE {
+			services = append(services, svc)
+		}
+	})
 
 	return services
 }
 
-func srvForService(svc *service.Service) *dns.SRV {
+func srvForService(svc *service.Service, config *Config) *dns.SRV {
+	// No ports? Nothing to say. Unfortunately means we can't
+	// serve SRV records for things in host networking mode.
+	if len(svc.Ports) < 1 {
+		return nil
+	}
+
 	return &dns.SRV{
 		Hdr: dns.RR_Header{
 			Name:   fmt.Sprintf("_%s._%s.%s", svc.Name, "tcp", config.BaseDomain),
@@ -62,8 +79,8 @@ func srvForService(svc *service.Service) *dns.SRV {
 		},
 		Priority: 0,
 		Weight:   10,
-		Port:     51553,
-		Target:   dns.Fqdn("some-host"), // Hostname
+		Port:     uint16(svc.Ports[0].Port),
+		Target:   dns.Fqdn(svc.Hostname), // Hostname
 	}
 }
 
@@ -75,38 +92,32 @@ func handleSidecar(w dns.ResponseWriter, r *dns.Msg, config *Config, rcvr *recei
 
 	svcs := getServicesForQuery(r, rcvr.CurrentState)
 
+	// Send empty reply
+	if len(svcs) < 1 {
+		w.WriteMsg(msg)
+		return
+	}
+
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
-			Name:   config.BaseDomain,
+			Name:   r.Question[0].Name,
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET,
 			Ttl:    config.Ttl,
 		},
-		Txt: []string{"Sidecar service " + "foo"},
-	}
-
-	srv := &dns.SRV{
-		Hdr: dns.RR_Header{
-			Name:   fmt.Sprintf("_%s._%s.%s", "foo", "tcp", config.BaseDomain),
-			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET,
-			Ttl:    config.Ttl,
-		},
-		Priority: 0,
-		Weight:   10,
-		Port:     51553,
-		Target:   dns.Fqdn("some-host"), // Hostname
+		Txt: []string{"Sidecar service " + svcs[0].Name},
 	}
 
 	switch r.Question[0].Qtype {
 	case dns.TypeANY:
 		fallthrough
 	case dns.TypeSRV:
-		msg.Answer = append(msg.Answer, srv)
+		for _, svc := range svcs {
+			msg.Answer = append(msg.Answer, srvForService(svc, config))
+		}
 		msg.Extra = append(msg.Extra, txt)
 	case dns.TypeTXT:
 		msg.Answer = append(msg.Answer, txt)
-		msg.Extra = append(msg.Extra, srv)
 	}
 
 	w.WriteMsg(msg)
@@ -184,13 +195,13 @@ func prepareClients(config *Config) {
 	udpClient = &dns.Client{
 		Net:            "udp",
 		Timeout:        config.UpstreamTimeout,
-		SingleInflight: true,
+		SingleInflight: false,
 	}
 
 	tcpClient = &dns.Client{
 		Net:            "udp",
 		Timeout:        config.UpstreamTimeout,
-		SingleInflight: true,
+		SingleInflight: false,
 	}
 }
 
@@ -217,11 +228,38 @@ func prepareNameservers(config *Config) {
 	config.ForwardServers = servers
 }
 
+func startCpuProfiler() {
+	log.Info("Starting CPU profiler")
+	profilerFile, err := os.Create("sidecar-dns.cpu.prof")
+	if err != nil {
+		log.Fatalf("Can't write profiling file %s", err)
+	}
+	pprof.StartCPUProfile(profilerFile)
+}
+
+func startSignalHandler() {
+	sigChannel := make(chan os.Signal, 1)
+	signal.Notify(sigChannel, os.Interrupt)
+	go func() {
+		for sig := range sigChannel {
+			log.Printf("Captured %v, stopping profiler and exiting..", sig)
+			pprof.StopCPUProfile()
+			profilerFile.Close()
+			os.Exit(0)
+		}
+	}()
+}
+
 func main() {
 	var config Config
 	err := envconfig.Process("sdns", &config)
 	if err != nil {
 		log.Fatalf("Unable to process environment variables: %s", err)
+	}
+
+	if config.ProfileCpu {
+		startSignalHandler()
+		startCpuProfiler()
 	}
 
 	// Make sure we have a FQDN as the BaseDomain
