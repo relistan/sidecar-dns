@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"net"
 	_ "net/http/pprof"
-	"runtime/pprof"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -17,7 +17,7 @@ import (
 	log "github.com/Sirupsen/logrus"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/miekg/dns"
-	"github.com/relistan/rubberneck"
+	"gopkg.in/relistan/rubberneck.v1"
 )
 
 var (
@@ -38,27 +38,32 @@ type Config struct {
 	ProfileCpu      bool          `split_words:"true"`
 }
 
-// We wrap these up into a dns.HandlerFunc using makeHandler()
-type wrappedHandlerFunc func(w dns.ResponseWriter, r *dns.Msg, config *Config, rcvr *receiver.Receiver)
+type ServiceMap map[string][]*service.Service
 
-func makeHandler(handler wrappedHandlerFunc, config *Config, rcvr *receiver.Receiver) dns.HandlerFunc {
+// We wrap these up into a dns.HandlerFunc using makeHandler()
+type wrappedHandlerFunc func(w dns.ResponseWriter, r *dns.Msg, config *Config, svcMap ServiceMap)
+
+func makeHandler(handler wrappedHandlerFunc, config *Config, svcMap ServiceMap) dns.HandlerFunc {
 	return func(w dns.ResponseWriter, r *dns.Msg) {
-		handler(w, r, config, rcvr)
+		handler(w, r, config, svcMap)
 	}
 }
 
-func getServicesForQuery(r *dns.Msg, state *catalog.ServicesState) []*service.Service {
+func getServicesForQuery(r *dns.Msg, svcMap ServiceMap) []*service.Service {
 	parts := strings.Split(r.Question[0].Name, ".")
-	svcName := parts[0]
+	svcName := parts[0][1:] // Currently kind of cheating on parsing the query string
 
 	var services []*service.Service
-	// TODO Super naive. Better to cache this in a map on each update from the
-	// receiver rather than on each request! state.ByService() returns the right map.
-	state.EachService(func(hostname *string, id *string, svc *service.Service) {
-		if svc.Name == svcName && svc.Status == service.ALIVE {
+
+	if len(svcName) < 1 || len(svcMap[svcName]) < 1 {
+		return services
+	}
+
+	for _, svc := range svcMap[svcName] {
+		if svc.Status == service.ALIVE {
 			services = append(services, svc)
 		}
-	})
+	}
 
 	return services
 }
@@ -80,17 +85,54 @@ func srvForService(svc *service.Service, config *Config) *dns.SRV {
 		Priority: 0,
 		Weight:   10,
 		Port:     uint16(svc.Ports[0].Port),
-		Target:   dns.Fqdn(svc.Hostname), // Hostname
+		Target:   fmt.Sprintf(
+			"%s.%s.%s.addr.%s", svc.Name, svc.ID, svc.Hostname, config.BaseDomain,
+		),
 	}
 }
 
-// DNS handler to serve records from Sidecar
-func handleSidecar(w dns.ResponseWriter, r *dns.Msg, config *Config, rcvr *receiver.Receiver) {
+func handleARecords(w dns.ResponseWriter, r *dns.Msg, config *Config, svcMap ServiceMap) {
 	msg := new(dns.Msg)
 	msg.SetReply(r)
 	msg.Compress = config.Compress
 
-	svcs := getServicesForQuery(r, rcvr.CurrentState)
+	svcs := getServicesForQuery(r, svcMap)
+
+	// Send empty reply
+	if len(svcs) < 1 {
+		w.WriteMsg(msg)
+		return
+	}
+
+	txt := &dns.TXT{
+		Hdr: dns.RR_Header{
+			Name:   r.Question[0].Name,
+			Rrtype: dns.TypeTXT,
+			Class:  dns.ClassINET,
+			Ttl:    config.Ttl,
+		},
+		Txt: []string{"Sidecar service " + svcs[0].Name},
+	}
+
+	switch r.Question[0].Qtype {
+	case dns.TypeANY:
+		fallthrough
+	case dns.A:
+		for _, svc := range svcs {
+			msg.Answer = append(msg.Answer, srvForService(svc, config))
+		}
+		msg.Extra = append(msg.Extra, txt)
+
+	w.WriteMsg(msg)
+}
+
+// DNS handler to serve records from Sidecar
+func handleBaseDomain(w dns.ResponseWriter, r *dns.Msg, config *Config, svcMap ServiceMap) {
+	msg := new(dns.Msg)
+	msg.SetReply(r)
+	msg.Compress = config.Compress
+
+	svcs := getServicesForQuery(r, svcMap)
 
 	// Send empty reply
 	if len(svcs) < 1 {
@@ -147,18 +189,22 @@ func withRetries(delays []int, fn func() error) error {
 
 // Forward records for domains that we don't host. This allows sidecar-dns to be
 // the resolver for all records if needed.
-func handleForward(w dns.ResponseWriter, r *dns.Msg, config *Config, _ *receiver.Receiver) {
+func handleForward(w dns.ResponseWriter, r *dns.Msg, config *Config, _ ServiceMap) {
 	client := udpClient
 
 	if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
 		client = tcpClient
 	}
 
+	var tried bool
 	err := withRetries([]int{100, 300, 500, 1000}, func() error {
 		upstream := roundRobin(config.ForwardServers)
 		record, _, err := client.Exchange(r, upstream)
 
-		log.Debugf("Retrying against %s", upstream)
+		if tried {
+			log.Debugf("Retrying against %s", upstream)
+		}
+		tried = true
 
 		// Success, write reply and return
 		if err == nil {
@@ -252,10 +298,14 @@ func startSignalHandler() {
 
 func main() {
 	var config Config
+	var svcMap ServiceMap
+
 	err := envconfig.Process("sdns", &config)
 	if err != nil {
 		log.Fatalf("Unable to process environment variables: %s", err)
 	}
+
+	log.SetLevel(log.DebugLevel)
 
 	if config.ProfileCpu {
 		startSignalHandler()
@@ -268,7 +318,9 @@ func main() {
 	// Set up the receiver
 	rcvr := &receiver.Receiver{
 		ReloadChan: make(chan time.Time, RELOAD_BUFFER),
-		OnUpdate:   func(state *catalog.ServicesState) {}, // Do nothing
+		OnUpdate: func(state *catalog.ServicesState) {
+			svcMap = state.ByService()
+		}, // Store as the mapped structure for easy lookup
 	}
 
 	prepareNameservers(&config)
@@ -285,12 +337,15 @@ func main() {
 		log.Warnf("Unable to fetch Sidecar state on startup! Continuing... %s", err)
 	}
 
-	// Handle the requested domain, serving records from Sidecar
-	dns.HandleFunc(config.BaseDomain, makeHandler(handleSidecar, &config, rcvr))
+	// Handle A records for names served in SRV records
+	dns.HandleFunc("addr." + config.BaseDomain, makeHandler(handleARecords, &config, svcMap))
+
+	// Handle the requested domain, serving SRV records from Sidecar
+	dns.HandleFunc(config.BaseDomain, makeHandler(handleBaseDomain, &config, svcMap))
 
 	// If we have ForwardServers, then we want to run the forward handler
 	if len(config.ForwardServers) > 0 {
-		dns.HandleFunc(".", makeHandler(handleForward, &config, rcvr))
+		dns.HandleFunc(".", makeHandler(handleForward, &config, svcMap))
 	}
 
 	go serveDns(&config, "tcp")
