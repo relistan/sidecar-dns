@@ -88,12 +88,11 @@ func main() {
 	config.BaseDomain = dns.Fqdn(config.BaseDomain)
 
 	// Set up the receiver
-	rcvr := &receiver.Receiver{
-		ReloadChan: make(chan time.Time, RELOAD_BUFFER),
-		OnUpdate: func(state *catalog.ServicesState) {
+	rcvr := receiver.NewReceiver(RELOAD_BUFFER,
+		func(state *catalog.ServicesState) {
 			svcMap = state.ByService()
 		}, // Store as the mapped structure for easy lookup
-	}
+	)
 
 	// Let's rubberneck that config
 	rubberneck.
@@ -111,7 +110,7 @@ func main() {
 	go serveDns(&config, "udp")
 
 	// Watch for updates and manage the state
-	//go rcvr.ProcessUpdates()
+	go rcvr.ProcessUpdates()
 
 	// Run the web API and block until it completes
 	serveHttp("0.0.0.0", 7780, rcvr)

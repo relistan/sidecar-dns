@@ -46,12 +46,15 @@ func configureDnsServer(config *Config, svcMap ServiceMap) {
 // Make sure we have ports appended to nameservers. Default to 53.
 func prepareNameservers(config *Config) {
 	if len(config.ForwardServers) < 1 {
-		log.Warn("No forwarding servers provided. Defaulting to server(s) from /etc/resolv.conf!")
 		defaultCli, err := dns.ClientConfigFromFile("/etc/resolv.conf")
 		if err != nil {
 			log.Fatalf("Unable to configure ANY forwarding servers: %s", err)
 		}
 		config.ForwardServers = defaultCli.Servers
+		log.Warnf(
+			"No forwarding servers provided. Defaulting to server(s) from /etc/resolv.conf: %s",
+			strings.Join(config.ForwardServers, ", "),
+		)
 	}
 
 	servers := make([]string, len(config.ForwardServers))
