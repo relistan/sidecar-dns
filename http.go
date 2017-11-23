@@ -58,6 +58,16 @@ func stateHandler(response http.ResponseWriter, req *http.Request, rcvr *receive
 		return
 	}
 
+	if req.FormValue("byservice") == "true" {
+		services, err := json.Marshal(rcvr.CurrentState.ByService())
+		if err != nil {
+			http.Error(response, "Can't marshal state in service format!", 500)
+			return
+		}
+		response.Write(services)
+		return
+	}
+
 	response.Write(rcvr.CurrentState.Encode())
 }
 
