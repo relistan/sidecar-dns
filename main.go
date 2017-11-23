@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -49,9 +50,56 @@ func makeHandler(handler wrappedHandlerFunc, config *Config, svcMap ServiceMap) 
 	}
 }
 
-func getServicesForQuery(r *dns.Msg, svcMap ServiceMap) []*service.Service {
-	parts := strings.Split(r.Question[0].Name, ".")
+func getIPsForQuery(query string, svcMap ServiceMap) []string {
+	var addresses []string
+
+	parts := strings.Split(query, ".")
+	if len(parts) < 4 {
+		log.Warnf("Got invalid addr query: '%s'", query)
+		return addresses
+	}
+
+	// Query strings should be e.g.
+	// 10109.tcp.nginx-raster.cc299047c106.a.sidecar.local
+
+	portStr := parts[0]
+	proto   := parts[1]
+	svcName := parts[2]
+	svcID := parts[3]
+
+	if len(svcName) < 1 || len(svcMap[svcName]) < 1 {
+		return addresses
+	}
+
+	portInt, err := strconv.ParseInt(portStr, 10, 64)
+	if err != nil {
+		log.Errorf("Unable to parse port! Got '%s'", portStr)
+		return addresses
+	}
+
+	for _, svc := range svcMap[svcName] {
+		if svc.ID != svcID {
+			continue
+		}
+
+		// No Alive check... we need to serve the IP if we know it
+
+		for _, port := range svc.Ports {
+			if port.Type == proto && port.ServicePort == portInt {
+				addresses = append(addresses, port.IP)
+			}
+		}
+	}
+
+	return addresses
+}
+
+func getServicesForQuery(query string, svcMap ServiceMap) []*service.Service {
+	parts := strings.Split(query, ".")
 	svcName := parts[0][1:] // Currently kind of cheating on parsing the query string
+
+	// Query strings should be e.g.
+	// _10111._nginx-raster._tcp.sidecar.local
 
 	var services []*service.Service
 
@@ -68,61 +116,84 @@ func getServicesForQuery(r *dns.Msg, svcMap ServiceMap) []*service.Service {
 	return services
 }
 
-func srvForService(svc *service.Service, config *Config) *dns.SRV {
+// srvForService returns a formatted SRV record for this Sidecar service
+func srvForService(svc *service.Service, portStr string, config *Config) *dns.SRV {
 	// No ports? Nothing to say. Unfortunately means we can't
 	// serve SRV records for things in host networking mode.
 	if len(svc.Ports) < 1 {
 		return nil
 	}
 
+	port, err := strconv.ParseInt(portStr, 10, 64)
+	if err != nil {
+		return nil
+	}
+
+	var foundPort service.Port
+	for _, p := range svc.Ports {
+		if p.ServicePort == port {
+			foundPort = p
+			break
+		}
+	}
+
+	if foundPort.Port == 0 {
+		log.Warnf("Found port for %s but Port was nil", svc.Name)
+		return nil
+	}
+
 	return &dns.SRV{
 		Hdr: dns.RR_Header{
-			Name:   fmt.Sprintf("_%s._%s.%s", svc.Name, "tcp", config.BaseDomain),
+			Name:   fmt.Sprintf("_%s._%s.%s", svc.Name, foundPort.Type, config.BaseDomain),
 			Rrtype: dns.TypeSRV,
 			Class:  dns.ClassINET,
 			Ttl:    config.Ttl,
 		},
 		Priority: 0,
 		Weight:   10,
-		Port:     uint16(svc.Ports[0].Port),
-		Target:   fmt.Sprintf(
-			"%s.%s.%s.addr.%s", svc.Name, svc.ID, svc.Hostname, config.BaseDomain,
+		Port:     uint16(foundPort.Port),
+		Target: fmt.Sprintf(
+			"%d.%s.%s.%s.a.%s", foundPort.ServicePort, foundPort.Type, svc.Name, svc.ID, config.BaseDomain,
 		),
 	}
 }
 
+// aForIP returns a formatted A record for this IP address
+func aForIP(query, addr string, config *Config) *dns.A {
+	return &dns.A{
+		Hdr: dns.RR_Header{
+			Name:   query,
+			Rrtype: dns.TypeA,
+			Class:  dns.ClassINET,
+			Ttl:    config.Ttl,
+		},
+		A: net.ParseIP(addr),
+	}
+}
+
+// DNS handler that responds to A record requests on our domain
 func handleARecords(w dns.ResponseWriter, r *dns.Msg, config *Config, svcMap ServiceMap) {
 	msg := new(dns.Msg)
 	msg.SetReply(r)
 	msg.Compress = config.Compress
 
-	svcs := getServicesForQuery(r, svcMap)
+	query := r.Question[0].Name
+	addrs := getIPsForQuery(query, svcMap)
 
 	// Send empty reply
-	if len(svcs) < 1 {
+	if len(addrs) < 1 {
 		w.WriteMsg(msg)
 		return
 	}
 
-	txt := &dns.TXT{
-		Hdr: dns.RR_Header{
-			Name:   r.Question[0].Name,
-			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET,
-			Ttl:    config.Ttl,
-		},
-		Txt: []string{"Sidecar service " + svcs[0].Name},
-	}
 
 	switch r.Question[0].Qtype {
-	case dns.TypeANY:
-		fallthrough
-	case dns.A:
-		for _, svc := range svcs {
-			msg.Answer = append(msg.Answer, srvForService(svc, config))
+	case dns.TypeA:
+		for _, addr := range addrs {
+			msg.Answer = append(msg.Answer, aForIP(query, addr, config))
+			log.Debugf("Responding with A record... %#v", msg.Answer[len(msg.Answer)-1])
 		}
-		msg.Extra = append(msg.Extra, txt)
-
+	}
 	w.WriteMsg(msg)
 }
 
@@ -132,7 +203,13 @@ func handleBaseDomain(w dns.ResponseWriter, r *dns.Msg, config *Config, svcMap S
 	msg.SetReply(r)
 	msg.Compress = config.Compress
 
-	svcs := getServicesForQuery(r, svcMap)
+	parts := strings.Split(r.Question[0].Name, ".")
+	if len(parts) < 2 {
+		w.WriteMsg(msg)
+		return
+	}
+	svcs := getServicesForQuery(strings.Join(parts[1:len(parts)-1], "."), svcMap)
+	port := parts[0][1:]
 
 	// Send empty reply
 	if len(svcs) < 1 {
@@ -147,7 +224,7 @@ func handleBaseDomain(w dns.ResponseWriter, r *dns.Msg, config *Config, svcMap S
 			Class:  dns.ClassINET,
 			Ttl:    config.Ttl,
 		},
-		Txt: []string{"Sidecar service " + svcs[0].Name},
+		Txt: []string{"Sidecar service " + svcs[0].Name + " port " + port},
 	}
 
 	switch r.Question[0].Qtype {
@@ -155,7 +232,10 @@ func handleBaseDomain(w dns.ResponseWriter, r *dns.Msg, config *Config, svcMap S
 		fallthrough
 	case dns.TypeSRV:
 		for _, svc := range svcs {
-			msg.Answer = append(msg.Answer, srvForService(svc, config))
+			srv := srvForService(svc, port, config)
+			if srv != nil {
+				msg.Answer = append(msg.Answer, srv)
+			}
 		}
 		msg.Extra = append(msg.Extra, txt)
 	case dns.TypeTXT:
@@ -338,7 +418,7 @@ func main() {
 	}
 
 	// Handle A records for names served in SRV records
-	dns.HandleFunc("addr." + config.BaseDomain, makeHandler(handleARecords, &config, svcMap))
+	dns.HandleFunc("a."+config.BaseDomain, makeHandler(handleARecords, &config, svcMap))
 
 	// Handle the requested domain, serving SRV records from Sidecar
 	dns.HandleFunc(config.BaseDomain, makeHandler(handleBaseDomain, &config, svcMap))
@@ -352,7 +432,7 @@ func main() {
 	go serveDns(&config, "udp")
 
 	// Watch for updates and manage the state
-	go rcvr.ProcessUpdates()
+	//go rcvr.ProcessUpdates()
 
 	// Run the web API and block until it completes
 	serveHttp("0.0.0.0", 7780, rcvr)
